@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // Thread represents a Zed assistant thread from the SQLite database
@@ -38,15 +38,15 @@ type EntireMessage struct {
 
 // OpenCodeInfo matches the info structure from OpenCode checkpoints
 type OpenCodeInfo struct {
-	ID         string           `json:"id"`
-	Slug       string           `json:"slug,omitempty"`
-	ProjectID  string           `json:"projectID,omitempty"`
+	ID        string           `json:"id"`
+	Slug      string           `json:"slug,omitempty"`
+	ProjectID string           `json:"projectID,omitempty"`
 	Directory string           `json:"directory,omitempty"`
 	ParentID  string           `json:"parentID,omitempty"`
 	Title     string           `json:"title,omitempty"`
 	Version   string           `json:"version,omitempty"`
 	Summary   *OpenCodeSummary `json:"summary,omitempty"`
-	Model     *OpenCodeModel  `json:"model,omitempty"`
+	Model     *OpenCodeModel   `json:"model,omitempty"`
 }
 
 type OpenCodeSummary struct {
@@ -57,17 +57,17 @@ type OpenCodeSummary struct {
 
 type OpenCodeModel struct {
 	ProviderID string `json:"providerID,omitempty"`
-	ModelID  string `json:"modelID,omitempty"`
+	ModelID    string `json:"modelID,omitempty"`
 }
 
 type OpenCodeMessageInfo struct {
-	Role     string        `json:"role"`
-	Time     OpenCodeTime `json:"time"`
-	Tools   OpenCodeTools `json:"tools"`
-	Agent   string       `json:"agent,omitempty"`
-	Model   OpenCodeModel `json:"model,omitempty"`
-	ID       string       `json:"id,omitempty"`
-	SessionID string    `json:"sessionID,omitempty"`
+	Role      string        `json:"role"`
+	Time      OpenCodeTime  `json:"time"`
+	Tools     OpenCodeTools `json:"tools"`
+	Agent     string        `json:"agent,omitempty"`
+	Model     OpenCodeModel `json:"model,omitempty"`
+	ID        string        `json:"id,omitempty"`
+	SessionID string        `json:"sessionID,omitempty"`
 }
 
 type OpenCodeTime struct {
@@ -79,35 +79,35 @@ type OpenCodeTools struct {
 }
 
 type OpenCodePart struct {
-	Type      string           `json:"type"`
-	Text     string           `json:"text,omitempty"`
-	ID       string           `json:"id,omitempty"`
-	MessageID string        `json:"messageID,omitempty"`
-	SessionID string        `json:"sessionID,omitempty"`
-	ToolUse *OpenCodeToolUse  `json:"tool_use,omitempty"`
-	Result  *OpenCodeToolResult `json:"result,omitempty"`
+	Type      string              `json:"type"`
+	Text      string              `json:"text,omitempty"`
+	ID        string              `json:"id,omitempty"`
+	MessageID string              `json:"messageID,omitempty"`
+	SessionID string              `json:"sessionID,omitempty"`
+	ToolUse   *OpenCodeToolUse    `json:"tool_use,omitempty"`
+	Result    *OpenCodeToolResult `json:"result,omitempty"`
 }
 
 type OpenCodeToolUse struct {
 	Name            string                 `json:"name"`
 	ID              string                 `json:"id,omitempty"`
-	Input          map[string]interface{} `json:"input,omitempty"`
-	IsInputComplete bool                 `json:"is_input_complete,omitempty"`
+	Input           map[string]interface{} `json:"input,omitempty"`
+	IsInputComplete bool                   `json:"is_input_complete,omitempty"`
 }
 
 type OpenCodeToolResult struct {
 	ID     string `json:"id"`
 	Output string `json:"output,omitempty"`
-	Error string `json:"error,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 type OpenCodeMessage struct {
 	Info  *OpenCodeMessageInfo `json:"info"`
-	Parts []OpenCodePart    `json:"parts"`
+	Parts []OpenCodePart       `json:"parts"`
 }
 
 type OpenCodeTranscript struct {
-	Info     *OpenCodeInfo      `json:"info"`
+	Info     *OpenCodeInfo     `json:"info"`
 	Messages []OpenCodeMessage `json:"messages"`
 }
 
@@ -256,6 +256,9 @@ Environment:
   ENTIRE_REPO_ROOT       Git repo root (auto-detected if unset)
   Zed DB location        Linux:  ~/.local/share/zed/threads/threads.db
                          macOS:  ~/Library/Application Support/Zed/threads/threads.db
+                         Windows: ~/AppData/Local/Zed/threads/threads.db
+  ZED_DATA_DIR           Override the Zed data directory (use <dir>/threads/threads.db).
+                         Mirrors Zed's own --data-dir flag. Optional.
 `)
 }
 
@@ -419,7 +422,7 @@ func convertToOpenCodeFormat(threadID, sessionID string, rawData []byte) (*OpenC
 	}
 
 	info := &OpenCodeInfo{
-		ID:         sessionID,
+		ID:        sessionID,
 		Directory: os.Getenv("ENTIRE_REPO_ROOT"),
 	}
 
@@ -548,7 +551,7 @@ func extractPartsFromContent(contentRaw interface{}) []OpenCodePart {
 				ToolUse: &OpenCodeToolUse{
 					Name:            name,
 					ID:              id,
-					Input:          input,
+					Input:           input,
 					IsInputComplete: isComplete,
 				},
 			})
@@ -820,7 +823,7 @@ func handleTranscript() {
 		log.Fatalf("Could not find Zed database: %v", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro") // Open read-only
+	db, err := openZedDB(dbPath) // Open read-only
 	if err != nil {
 		log.Fatalf("Could not open database: %v", err)
 	}
@@ -847,23 +850,55 @@ func handleTranscript() {
 	fmt.Printf("%s\n", out)
 }
 
+// zedDBPathCandidates returns the candidate filesystem paths where Zed stores
+// its threads database (threads.db) for the given home directory on the current
+// platform. The paths mirror Zed's own platform-specific data directory:
+//
+//   - macOS:  <home>/Library/Application Support/Zed/threads/threads.db
+//   - Windows: <home>\AppData\Local\Zed\threads\threads.db  (primary, %LOCALAPPDATA%)
+//     <home>\AppData\Roaming\Zed\threads\threads.db (fallback for older/preview builds)
+//   - Linux:   <home>/.local/share/zed/threads/threads.db
+func zedDBPathCandidates(home string) []string {
+	switch runtime.GOOS {
+	case "darwin":
+		return []string{
+			filepath.Join(home, "Library", "Application Support", "Zed", "threads", "threads.db"),
+		}
+	case "windows":
+		// %LOCALAPPDATA% resolves to <home>\AppData\Local
+		return []string{
+			filepath.Join(home, "AppData", "Local", "Zed", "threads", "threads.db"),
+			filepath.Join(home, "AppData", "Roaming", "Zed", "threads", "threads.db"),
+		}
+	default: // linux / freebsd
+		if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+			return []string{
+				filepath.Join(xdg, "zed", "threads", "threads.db"),
+			}
+		}
+		return []string{
+			filepath.Join(home, ".local", "share", "zed", "threads", "threads.db"),
+		}
+	}
+}
+
 func getZedDBPath() (string, error) {
 	usr, err := user.Current()
 	if err != nil {
 		return "", err
 	}
 
-	var candidates []string
-	switch runtime.GOOS {
-	case "darwin":
-		candidates = []string{
-			filepath.Join(usr.HomeDir, "Library", "Application Support", "Zed", "threads", "threads.db"),
-		}
-	default: // linux
-		candidates = []string{
-			filepath.Join(usr.HomeDir, ".local", "share", "zed", "threads", "threads.db"),
+	// Allow callers (and tests) to point at a non-default Zed data directory.
+	// This mirrors Zed's own `--data-dir` flag, so a database located at
+	// <ZED_DATA_DIR>/threads/threads.db is picked up on every platform.
+	if dataDir := os.Getenv("ZED_DATA_DIR"); dataDir != "" {
+		candidate := filepath.Join(dataDir, "threads", "threads.db")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
 		}
 	}
+
+	candidates := zedDBPathCandidates(usr.HomeDir)
 
 	for _, path := range candidates {
 		if _, err := os.Stat(path); err == nil {
@@ -872,6 +907,21 @@ func getZedDBPath() (string, error) {
 	}
 
 	return "", fmt.Errorf("Zed threads database not found (checked %v)", candidates)
+}
+
+// openZedDB opens the Zed threads SQLite database read-only.
+//
+// It uses the pure-Go "sqlite" driver (modernc.org/sqlite) so that the binary
+// builds and runs on every platform without requiring a C compiler (CGO). That
+// matters on Windows, where a clean `go install` does not bring along MinGW.
+//
+// The read-only `mode=ro` constraint is expressed via a `file:` URI because the
+// pure-Go driver only honors SQLite query parameters (such as `mode=ro`) when
+// the source string is a URI filename. Converting the path to forward slashes
+// keeps this correct on Windows, where `os.PathSeparator` is `\`.
+func openZedDB(dbPath string) (*sql.DB, error) {
+	uri := "file:" + filepath.ToSlash(dbPath) + "?mode=ro"
+	return sql.Open("sqlite", uri)
 }
 
 func handleStart() {
@@ -892,7 +942,7 @@ func getLatestThreadMeta() (threadID string, lastUserMsg string, msgCount int, r
 	if err != nil {
 		return "", "", 0, nil
 	}
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro")
+	db, err := openZedDB(dbPath)
 	if err != nil {
 		return "", "", 0, nil
 	}
@@ -1077,12 +1127,12 @@ func writeSessionSnapshot(sessionID, threadID, lastPrompt, phase string, rawData
 	// Write the session metadata JSON (what session-handoff reads first)
 	now := time.Now().Format(time.RFC3339)
 	sessionMeta := map[string]interface{}{
-		"session_id":          sessionID,
-		"agent_type":          "Zed",
-		"phase":               phase,
-		"started_at":          now,
+		"session_id":            sessionID,
+		"agent_type":            "Zed",
+		"phase":                 phase,
+		"started_at":            now,
 		"last_interaction_time": now,
-		"transcript_path":     transcriptPath,
+		"transcript_path":       transcriptPath,
 	}
 	if lastPrompt != "" {
 		sessionMeta["last_prompt"] = lastPrompt
@@ -1272,7 +1322,7 @@ func handleExtractBranch() {
 	if err != nil {
 		log.Fatalf("Could not find Zed database: %v", err)
 	}
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro")
+	db, err := openZedDB(dbPath)
 	if err != nil {
 		log.Fatalf("Could not open database: %v", err)
 	}
@@ -1676,7 +1726,7 @@ func openDBFromRef(sessionRef string) (*sql.DB, string, error) {
 		}
 		dbPath = p
 	}
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro")
+	db, err := openZedDB(dbPath)
 	if err != nil {
 		return nil, "", err
 	}
@@ -2007,7 +2057,10 @@ func handleInstallHooks() {
 		postCommitPath := filepath.Join(hooksDir, "post-commit")
 		postCommitContent := `
 # --- Entire Zed Agent Lifecycle Hook ---
-export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:$PATH"
+# Preload common install locations so the Entire CLI is found even when it was
+# installed with go install/go build (output goes to $(go env GOPATH)/bin).
+# Works under the POSIX sh Git runs hooks through on Linux, macOS, and Windows.
+export PATH="$HOME/.local/bin:$HOME/go/bin:$HOME/bin:/usr/local/bin:$PATH"
 ENTIRE_CMD="entire"
 if command -v entire-patched >/dev/null 2>&1; then ENTIRE_CMD="entire-patched"; fi
 
@@ -2111,7 +2164,7 @@ func handleCalculateTokens() {
 		return
 	}
 
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro") // Open read-only
+	db, err := openZedDB(dbPath) // Open read-only
 	if err != nil {
 		fmt.Println("{}")
 		return

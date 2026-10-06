@@ -51,6 +51,9 @@ This dramatically reduces checkpoint sizes. Instead of storing ~10 MB per checkp
 |-------|------|
 | Linux | `~/.local/share/zed/threads/threads.db` |
 | macOS | `~/Library/Application Support/Zed/threads/threads.db` |
+| Windows | `~/AppData/Local/Zed/threads/threads.db` |
+
+> **Windows note:** Zed stores its user data in `%LOCALAPPDATA%\Zed` (i.e. `~\AppData\Local\Zed`). If you installed Zed via the *Preview* release that wrote to the roaming config directory instead, the roaming path (`~\AppData\Roaming\Zed\threads\threads.db`) is checked as a fallback. You can also override the data directory explicitly by setting the `ZED_DATA_DIR` environment variable to point at a directory containing `threads/threads.db`; this mirrors Zed's own `--data-dir` flag and works on every platform.
 
 ## Capabilities
 
@@ -256,20 +259,106 @@ entire-agent-zed install-hooks
 
 ## Building and Installing
 
+This agent is written in Go and compiles to a single static binary with **no
+runtime dependencies** — see the [Dependencies](#dependencies) section below. It
+uses a pure-Go SQLite driver, so **no C compiler is required on any platform**,
+including Windows (no MinGW / MSVC needed).
+
+### Quick start (with `just`)
+
+`just` is the recommended build runner — a single static binary with no
+dependencies. Install it once (`winget install casey.just` / `scoop install just`,
+or grab a release from https://github.com/casey/just), then:
+
 ```bash
-make test      # Run all tests (57 tests)
-make install   # Build and install to ~/.local/bin/entire-agent-zed
-make uninstall # Remove from ~/.local/bin
-make clean     # Remove local build artifact
+just build          # ./entire-agent-zed (Unix) / .\entire-agent-zed.exe (Windows)
+just install        # build + copy to $(go env GOPATH)/bin
+just uninstall      # remove from $(go env GOPATH)/bin
+just clean          # remove the local build artifact
+just test           # run the full test suite
 ```
 
-The standard workflow after making changes:
+Run `just` with no arguments to list every recipe. The `justfile` is
+cross-platform: it emits `entire-agent-zed.exe` on Windows and `entire-agent-zed`
+elsewhere automatically.
+
+> **Note:** the module's import path ends in `-parser`, so a bare
+> `go install .` / `go build` (without `-o`) names the output
+> `entire-agent-zed-parser` (or `.exe`). The commands below and the `justfile`
+> explicitly name it `entire-agent-zed(.exe)` to match the CLI used by the git
+> hooks and documentation.
+
+### Quick start (without `just`)
+
+If you prefer not to install `just`, the legacy `Makefile` still works (`make
+build`, `make install`, `make test`, `make uninstall`, `make clean`) and is
+cross-platform — `make` ships with Git Bash / MSYS2 on Windows. Or build directly
+with the Go toolchain:
 
 ```bash
-make test && make install
+# Linux / macOS
+go build -o entire-agent-zed .
+
+# Windows — the .exe suffix is required for a directly runnable executable
+go build -o entire-agent-zed.exe .
 ```
+
+Then ensure `$(go env GOPATH)/bin` is on your `PATH` (defaults to `~/go/bin` on
+Linux/macOS and `%USERPROFILE%\go\bin` on Windows), then:
+
+```bash
+entire-agent-zed install-hooks   # installs the post-commit lifecycle hook
+```
+
+### Windows
+
+On Windows the binary is `entire-agent-zed.exe`. Because the SQLite driver is
+pure Go, a fresh `go build` (or `just build`) compiles it with no C toolchain
+(no MinGW / MSVC):
+
+```powershell
+go build -o entire-agent-zed.exe .
+```
+
+Copy `entire-agent-zed.exe` to a folder on your `PATH` (for example
+`%USERPROFILE%\go\bin`), then:
+
+```powershell
+entire-agent-zed install-hooks
+```
+
+> **Git hooks on Windows:** Git for Windows runs hooks through its bundled
+> `sh.exe`, so the installed `post-commit` hook (POSIX `sh`) works as-is. The
+> hook preloads `$HOME/go/bin` (via `export PATH=...:$HOME/go/bin:...`) so a
+> `go install` / `go build`-ed `entire` CLI is found when the hook runs.
+
+### Dependencies
+
+Zed stores its AI threads in a local SQLite database. Previously this agent used
+`github.com/mattn/go-sqlite3`, which is **CGO-only** and requires a C compiler
+(MinGW on Windows). That made the agent fail to build — or silently produce a
+non-functional stub — on a clean Windows install of Go with no C toolchain.
+
+The agent now uses [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite),
+a **100% pure-Go** SQLite driver. Benefits:
+
+- Builds anywhere with just the Go toolchain — no `gcc`/`MinGW`/`MSVC` needed.
+- Cross-platform: identical build on Linux, macOS, and Windows.
+- Read-only access to Zed's database is preserved via `file:<path>?mode=ro`.
 
 ## Changelog
+
+### 2026-10-06 - Windows Support
+
+- Added a Windows database path (`%LOCALAPPDATA%\Zed\threads\threads.db`) to `getZedDBPath()`, with a roaming-directory fallback.
+- Added a `ZED_DATA_DIR` environment variable override (mirrors Zed's `--data-dir`) on all platforms.
+- Replaced the CGO-only `github.com/mattn/go-sqlite3` driver with the pure-Go `modernc.org/sqlite` driver, so the binary builds on Windows with no C compiler.
+- Centralized all database opens through `openZedDB()` and use a portable `file:` URI read-only DSN.
+- Made the generated `post-commit` git hook preload `$HOME/go/bin` so a `go install`-ed CLI is discoverable on every OS.
+- Made the `Makefile` produce a `.exe` on Windows and install to `$(go env GOPATH)/bin`; added a `justfile` as the recommended cross-platform build runner (`just build`/`install`/`test`/`uninstall`/`clean`), which likewise handles the `.exe` suffix.
+- Fixed the test harness (`buildBinary`) to emit and execute a `.exe` on Windows so the integration tests run natively there.
+- Documented Windows setup, database location, and dependencies in the README.
+
 
 ### 2026-04-19 - Secret Redaction
 
