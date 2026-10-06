@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 var _ = strings.HasPrefix // silence unused import
@@ -311,7 +315,12 @@ func TestInstallHookFile_AlreadyInstalled(t *testing.T) {
 
 func buildBinary(t *testing.T) string {
 	t.Helper()
+	// On Windows an executable must carry a ".exe" suffix to be launched via
+	// os/exec; a bare name produced by `go build -o` cannot be started.
 	bin := filepath.Join(t.TempDir(), "entire-agent-zed")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	cmd := exec.Command("go", "build", "-o", bin, ".")
 	cmd.Dir = "."
 	out, err := cmd.CombinedOutput()
@@ -1450,4 +1459,116 @@ func TestRedactTranscript(t *testing.T) {
 	if inp["command"] != "ls" {
 		t.Errorf("expected command unchanged, got %v", inp["command"])
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Zed database path resolution (platform-specific + env override)
+// ---------------------------------------------------------------------------
+
+func TestZedDBPathCandidates(t *testing.T) {
+	home := "/fake-home"
+	cands := zedDBPathCandidates(home)
+	if len(cands) == 0 {
+		t.Fatal("expected at least one candidate path")
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		want := filepath.Join(home, "Library", "Application Support", "Zed", "threads", "threads.db")
+		if cands[0] != want {
+			t.Errorf("darwin: expected primary %q, got %q", want, cands[0])
+		}
+	case "windows":
+		want := filepath.Join(home, "AppData", "Local", "Zed", "threads", "threads.db")
+		if cands[0] != want {
+			t.Errorf("windows: expected primary (%%LOCALAPPDATA%%) %q, got %q", want, cands[0])
+		}
+		fallback := filepath.Join(home, "AppData", "Roaming", "Zed", "threads", "threads.db")
+		if len(cands) < 2 || cands[1] != fallback {
+			t.Errorf("windows: expected roaming fallback %q, got %v", fallback, cands)
+		}
+	default: // linux / freebsd
+		want := filepath.Join(home, ".local", "share", "zed", "threads", "threads.db")
+		if cands[0] != want {
+			t.Errorf("linux/freebsd: expected %q, got %q", want, cands[0])
+		}
+	}
+}
+
+func TestZedDBPathCandidates_XDG(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "freebsd" {
+		t.Skip("XDG_DATA_HOME only honored on linux/freebsd")
+	}
+	t.Setenv("XDG_DATA_HOME", "/custom-xdg")
+	cands := zedDBPathCandidates("ignored-home")
+	want := filepath.Join("/custom-xdg", "zed", "threads", "threads.db")
+	if cands[0] != want {
+		t.Errorf("expected XDG candidate %q, got %q", want, cands[0])
+	}
+}
+
+func TestGetZedDBPath_EnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	threadsDir := filepath.Join(dir, "threads")
+	if err := os.MkdirAll(threadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(threadsDir, "threads.db")
+	if err := os.WriteFile(dbPath, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZED_DATA_DIR", dir)
+
+	got, err := getZedDBPath()
+	if err != nil {
+		t.Fatalf("getZedDBPath failed: %v", err)
+	}
+	if got != dbPath {
+		t.Errorf("expected %q, got %q", dbPath, got)
+	}
+}
+
+func TestGetZedDBPath_NotFound(t *testing.T) {
+	// Point the override at a non-existent directory; if no real Zed DB exists
+	// on this machine, getZedDBPath should report an error.
+	t.Setenv("ZED_DATA_DIR", filepath.Join(t.TempDir(), "does-not-exist"))
+	if _, err := getZedDBPath(); err == nil {
+		t.Skip("a real Zed threads database exists on this machine; skipping not-found test")
+	}
+}
+
+// TestOpenZedDB_ReadOnlyRoundTrip verifies that the pure-Go SQLite driver opens
+// the database read-only (no C compiler / CGO required) and that writes are
+// rejected. This is the core of Windows support: a clean `go build` produces a
+// working binary without MinGW.
+func TestOpenZedDB_ReadOnlyRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "threads.db")
+
+	// Seed a DB using a writable connection (pure-Go driver, same "sqlite" name).
+	wdb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Skipf("pure-Go sqlite driver unavailable: %v", err)
+	}
+	if _, err := wdb.Exec("CREATE TABLE t(k TEXT PRIMARY KEY, v TEXT); INSERT INTO t(k,v) VALUES('a','b')"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	wdb.Close()
+
+	// Open read-only through the same helper the agent uses for Zed's DB.
+	rdb, err := openZedDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v string
+	if err := rdb.QueryRow("SELECT v FROM t WHERE k='a'").Scan(&v); err != nil {
+		t.Fatalf("read query: %v", err)
+	}
+	if v != "b" {
+		t.Errorf("expected v=b, got %q", v)
+	}
+	// Read-only connection must reject writes.
+	if _, err := rdb.Exec("INSERT INTO t(k,v) VALUES('x','y')"); err == nil {
+		t.Error("expected write to fail on a read-only database")
+	}
+	rdb.Close()
 }
